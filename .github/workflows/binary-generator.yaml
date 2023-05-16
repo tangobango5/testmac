@@ -8,7 +8,7 @@ jobs:
 
   Build-To-Deploy:
       name: Mac Test
-      runs-on: mac-test
+      runs-on: self-hosted
 
       steps:
       - name: Inject slug/short variables

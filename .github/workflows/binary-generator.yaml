@@ -22,4 +22,5 @@ jobs:
       
       - name: Custom commands
         run: |
-          echo "asd"
+          mkdir /Users/admin/rambo
+          touch /Users/admin/rambo/tt.txt

@@ -1,0 +1,264 @@
+name: CD - Prod
+on:
+  release:
+    types: [published]
+env:
+  ENV_BRANCH: 'master'
+
+jobs:
+
+  Tag-Checks:
+    name: Validate Release Tag
+    runs-on: ubuntu-latest
+    steps:
+    - name: ReleaseTag creation checks
+      id: check_release_tag
+      run: |
+        if [[ "${{ github.event.release.target_commitish }}" != "prod" ]]; then
+          echo "Release tag has been created from non-prod branch"
+          echo "delete_release=true" >> $GITHUB_OUTPUT
+        else
+          echo "Release tag has been created from prod branch"
+          echo "delete_release=false" >> $GITHUB_OUTPUT
+        fi
+    - uses: LambdaTest/delete-tag-and-release@v0.2.1
+      if: steps.check_release_tag.outputs.delete_release == 'true'
+      with:
+        delete_release: ${{ steps.check_release_tag.outputs.delete_release }} # default: false
+        tag_name: ${{ github.ref_name }} # tag name to delete
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: non-prod release tag detected
+      if: steps.check_release_tag.outputs.delete_release == 'true'
+      run: |
+        exit 1
+
+  Build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [Tag-Checks]
+    environment: master
+
+    steps:
+    - name: Inject slug/short variables
+      uses: rlespinasse/github-slug-action@v3.x
+
+    - name: Branch name
+      run: echo running on branch ${GITHUB_REF##*/}
+
+    - name: Set up Go 1.18
+      uses: actions/setup-go@v1
+      with:
+        go-version: 1.18
+
+    - name: Go Config
+      id: config
+      run: |
+        go env -w GOPRIVATE=github.com/LambdaTest
+        git config --global url."https://${{ secrets.ACCESS_TOKEN }}:x-oauth-basic@github.com/LambdaTest".insteadOf "https://github.com/LambdaTest"
+        echo "::set-output name=go-build::$(go env GOCACHE)"
+        echo "::set-output name=go-mod::$(go env GOMODCACHE)"
+
+    - name: Checkout Codebase
+      uses: actions/checkout@main
+
+    - name: Installing Garble
+      run: GOBIN=/usr/local/bin go install mvdan.cc/garble@v0.7.2
+
+    - name: Setup Golang caches
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-golang-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-golang-
+
+    - name: Build binaries
+      env:
+        CONFIG_PATH: github.com/LambdaTest/hypertest-foreman/pkg/secrets
+      run: |
+        AWS_LDFLAGS='-X "${{ env.CONFIG_PATH }}.AzureClientId=${{ secrets.AZURE_CLIENT_ID }}" -X "${{ env.CONFIG_PATH }}.AzureClientSecret=${{ secrets.AZURE_CLIENT_SECRET }}" -X "${{ env.CONFIG_PATH }}.AzureTenantId=${{ secrets.AZURE_TENANT_ID }}" -X "${{ env.CONFIG_PATH }}.AwsAccessKeyId=${{ secrets.AWS_ACCESS_KEY_ID }}" -X "${{ env.CONFIG_PATH }}.AwsSecretKeyId=${{ secrets.AWS_SECRET_ACCESS_KEY }}" -X "${{ env.CONFIG_PATH }}.AwsDefaultRegion=${{ secrets.AWS_DEFAULT_REGION }}" -X "${{ env.CONFIG_PATH }}.BearerToken=${{ secrets.BEARER_TOKEN }}" -X "${{ env.CONFIG_PATH }}.BinaryIdentifier=${{ secrets.BINARY_IDENTIFIER }}" -X "${{ env.CONFIG_PATH }}.LnsBrokers=${{ secrets.LNS_BROKERS }}" -X "${{ env.CONFIG_PATH }}.LnsQueueName=${{ secrets.LNS_QUEUE_NAME }}" -X "${{ env.CONFIG_PATH }}.MacType=macmini" -X "${{ env.CONFIG_PATH }}.Win11InfraQueueName=${{ secrets.WINDOWS_11_INFRA_QUEUE_NAME }}" -X "${{ env.CONFIG_PATH }}.LTBrowserCloudflarePath=${{ secrets.LTBrowserCloudflarePath }}"'
+        AZURE_LDFLAGS='-X "${{ env.CONFIG_PATH }}.SlackWebHookURL=${{ secrets.SLACK_NOTIFY_HOOK_URL }}" -X "${{ env.CONFIG_PATH }}.StorageAccountKey=${{ secrets.STORAGE_ACCOUNT_KEY }}" -X "${{ env.CONFIG_PATH }}.StorageAccountName=${{ secrets.STORAGE_ACCOUNT_NAME }}" -X "${{ env.CONFIG_PATH }}.QueuePlatform=${{ secrets.QUEUE_PLATFORM }}" -X "${{ env.CONFIG_PATH }}.ServiceBusNamespace=${{ secrets.SERVICE_BUS_NAMESPACE }}" -X "${{ env.CONFIG_PATH }}.LnsPlatform=${{ secrets.LNS_PLATFORM }}" -X "${{ env.CONFIG_PATH }}.DownloadBinaryStorageName=${{ secrets.DOWNLOAD_BINARY_STORAGE_NAME }}" -X "${{ env.CONFIG_PATH }}.SentinelApiUrl=${{ secrets.SENTINEL_API_URL }}"'
+        AKS_LDFLAGS='-X "${{ env.CONFIG_PATH }}.AKSDownloadBinaryStorageName=${{ secrets.AKS_DOWNLOAD_BINARY_STORAGE_NAME }}" -X "${{ env.CONFIG_PATH }}.AKSStorageAccountName=${{ secrets.AKS_STORAGE_ACCOUNT_NAME }}" -X "${{ env.CONFIG_PATH }}.AKSStorageAccountKey=${{ secrets.AKS_STORAGE_ACCOUNT_KEY }}" -X "${{ env.CONFIG_PATH }}.AKSLnsQueueName=${{ secrets.AKS_LNS_QUEUE_NAME }}"'
+        GIT_LDFLAGS='-X "${{ env.CONFIG_PATH }}.GitAuthToken=${{ secrets.GIT_AUTH_TOKEN }}" -X "${{ env.CONFIG_PATH }}.TTAGitPAT=${{ secrets.TTA_GIT_PAT }}"'
+
+        OS=$(echo "linux darwin windows darwin-m1")
+        for os in ${OS}; do
+        echo "building binary for $os"
+        rm -rf ./build/${os}
+        mkdir -p ./build/${os}
+
+        FLAGS=$(echo "AwsAccessKeyId ")
+        ENV_LDFLAG='-X "${{ env.CONFIG_PATH }}.Env=prod"'
+        if [ ${os} == "windows" ]; then
+          INFRA_QUEUE_LDFLAG='-X "${{ env.CONFIG_PATH }}.InfraQueueName=${{ secrets.WINDOWS_INFRA_QUEUE_NAME }}" -X "${{ env.CONFIG_PATH }}.DebugQueueName=${{ secrets.WINDOWS_INFRA_DEBUG_QUEUE_NAME }}" -X "${{ env.CONFIG_PATH }}.AKSInfraQueueName=${{ secrets.AKS_WINDOWS_INFRA_QUEUE_NAME }}"'
+          GOOS=${os} GOARCH=amd64 GOGARBLE=${{ env.CONFIG_PATH }} /usr/local/bin/garble build -ldflags "${AWS_LDFLAGS} ${AZURE_LDFLAGS} ${AKS_LDFLAGS} ${GIT_LDFLAGS} ${INFRA_QUEUE_LDFLAG} ${ENV_LDFLAG}" -o build/${os}/hypertest-foreman.exe main.go
+          echo "binary built for $os"
+        elif [ ${os} == "linux" ]; then
+          INFRA_QUEUE_LDFLAG='-X "${{ env.CONFIG_PATH }}.InfraQueueName=${{ secrets.LINUX_INFRA_QUEUE_NAME }}" -X "${{ env.CONFIG_PATH }}.DebugQueueName=${{ secrets.LINUX_INFRA_DEBUG_QUEUE_NAME }}" -X "${{ env.CONFIG_PATH }}.AKSInfraQueueName=${{ secrets.AKS_LINUX_INFRA_QUEUE_NAME }}" -X "${{ env.CONFIG_PATH }}.PerformanceReceiveQueueName=${{ secrets.PERFORMANCE_RECEIVE_QUEUE_NAME }}"'
+          GOOS=${os} GOARCH=amd64 CGO_ENABLED=0 GOGARBLE=${{ env.CONFIG_PATH }} /usr/local/bin/garble build -ldflags "${AWS_LDFLAGS} ${AZURE_LDFLAGS} ${AKS_LDFLAGS} ${GIT_LDFLAGS} ${INFRA_QUEUE_LDFLAG} ${ENV_LDFLAG}" -o build/${os}/hypertest-foreman main.go
+          echo "binary built for $os"
+        elif [ ${os} == "darwin-m1" ]; then
+          INFRA_QUEUE_LDFLAG='-X "${{ env.CONFIG_PATH }}.InfraQueueName=${{ secrets.MAC_INFRA_QUEUE_NAME }}" -X "${{ env.CONFIG_PATH }}.DebugQueueName=${{ secrets.MAC_INFRA_DEBUG_QUEUE_NAME }}" -X "${{ env.CONFIG_PATH }}.AKSInfraQueueName=${{ secrets.AKS_MAC_INFRA_QUEUE_NAME }}"'
+          GOOS=darwin GOARCH=arm64 GOGARBLE=${{ env.CONFIG_PATH }} /usr/local/bin/garble build -ldflags "${AWS_LDFLAGS} ${AZURE_LDFLAGS} ${AKS_LDFLAGS} ${GIT_LDFLAGS} ${INFRA_QUEUE_LDFLAG} ${ENV_LDFLAG}" -o build/${os}/hypertest-foreman main.go
+          echo "binary built for $os"
+        else
+          INFRA_QUEUE_LDFLAG='-X "${{ env.CONFIG_PATH }}.InfraQueueName=${{ secrets.MAC_INFRA_QUEUE_NAME }}" -X "${{ env.CONFIG_PATH }}.DebugQueueName=${{ secrets.MAC_INFRA_DEBUG_QUEUE_NAME }}" -X "${{ env.CONFIG_PATH }}.AKSInfraQueueName=${{ secrets.AKS_MAC_INFRA_QUEUE_NAME }}"'
+          GOOS=${os} GOARCH=amd64 GOGARBLE=${{ env.CONFIG_PATH }} /usr/local/bin/garble build -ldflags "${AWS_LDFLAGS} ${AZURE_LDFLAGS} ${AKS_LDFLAGS} ${GIT_LDFLAGS} ${INFRA_QUEUE_LDFLAG} ${ENV_LDFLAG}" -o build/${os}/hypertest-foreman main.go
+          echo "binary built for $os"
+        fi
+        if [[ $? -ne 0 ]]; then
+          exit
+        fi
+        done
+
+    - name: Setting up Environment
+      run: |
+        echo "CONNECTION_STRING=AZURE_CONNECTION_STRING_${ENV_BRANCH}" >> $GITHUB_ENV
+        echo "BOTNAME=Foreman bot ${GITHUB_REF_SLUG}" >> $GITHUB_ENV
+
+    - name: upload to benchmark storage-beta
+      uses: bacongobbler/azure-blob-storage-upload@v1.2.0
+      with:
+        source_dir: build
+        container_name: ht-binaries-beta
+        connection_string: ${{ secrets[env.CONNECTION_STRING] }}
+        sync: false
+        extra_args: --overwrite true
+
+    - uses: actions/upload-artifact@v2
+      with:
+        name: build
+        path: build
+
+  Deploy:
+    name: Deploy on Prod
+    runs-on: ubuntu-latest
+    needs: [Tag-Checks,Build]
+    environment: master-deploy
+
+    steps:
+    - uses: actions/download-artifact@v2
+      with:
+        name: build
+        path: build
+
+    - name: Setting up Environment
+      run: |
+        echo "CONNECTION_STRING=AZURE_CONNECTION_STRING_${ENV_BRANCH}" >> $GITHUB_ENV
+        echo "BENCHMARK_CONNECTION_STRING=AZURE_CONNECTION_STRING_OLD_ACCOUNT_${ENV_BRANCH}" >> $GITHUB_ENV
+        echo "BOTNAME=Foreman bot ${ENV_BRANCH}" >> $GITHUB_ENV
+
+    - name: upload to prod storage
+      uses: bacongobbler/azure-blob-storage-upload@v1.2.0
+      with:
+        source_dir: build
+        container_name: ht-binaries
+        connection_string: ${{ secrets[env.CONNECTION_STRING] }}
+        sync: false
+        extra_args: --overwrite true
+
+    - name: upload to benchmark storage - old
+      uses: bacongobbler/azure-blob-storage-upload@v1.2.0
+      with:
+        source_dir: build
+        container_name: ht-binaries
+        connection_string: ${{ secrets[env.BENCHMARK_CONNECTION_STRING] }}
+        sync: false
+        extra_args: --overwrite true
+
+    - name: Slack Notification
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        fields: repo,message,commit,author,action,eventName,ref,workflow,job,took
+        author_name: ${{ env.BOTNAME }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+      if: always()
+  build-and-deploy-on-prem:
+    runs-on: ubuntu-latest
+    needs: [ Tag-Checks ]
+    environment: onprem
+    steps:
+      - name: Inject slug/short variables
+        uses: rlespinasse/github-slug-action@v3.x
+
+      - name: Branch name
+        run: echo running on branch ${GITHUB_REF##*/}
+
+      - name: Set up Go 1.18
+        uses: actions/setup-go@v1
+        with:
+          go-version: 1.18
+
+      - name: Go Config
+        id: config
+        run: |
+          go env -w GOPRIVATE=github.com/LambdaTest
+          git config --global url."https://${{ secrets.ACCESS_TOKEN }}:x-oauth-basic@github.com/LambdaTest".insteadOf "https://github.com/LambdaTest"
+          echo "::set-output name=go-build::$(go env GOCACHE)"
+          echo "::set-output name=go-mod::$(go env GOMODCACHE)"
+
+      # checkout the repo
+      - name: 'Checkout GitHub Action'
+        uses: actions/checkout@main
+
+      - name: Build binaries[On-prem]
+        env:
+          CONFIG_PATH: github.com/LambdaTest/hypertest-foreman/pkg/secrets
+        run: |
+          AWS_LDFLAGS='-X "${{ env.CONFIG_PATH }}.AzureClientId=${{ secrets.AZURE_CLIENT_ID }}" -X "${{ env.CONFIG_PATH }}.AzureClientSecret=${{ secrets.AZURE_CLIENT_SECRET }}" -X "${{ env.CONFIG_PATH }}.AzureTenantId=${{ secrets.AZURE_TENANT_ID }}" -X "${{ env.CONFIG_PATH }}.AwsAccessKeyId=${{ secrets.AWS_ACCESS_KEY_ID }}" -X "${{ env.CONFIG_PATH }}.AwsSecretKeyId=${{ secrets.AWS_SECRET_ACCESS_KEY }}" -X "${{ env.CONFIG_PATH }}.AwsDefaultRegion=${{ secrets.AWS_DEFAULT_REGION }}" -X "${{ env.CONFIG_PATH }}.BearerToken=${{ secrets.BEARER_TOKEN }}" -X "${{ env.CONFIG_PATH }}.BinaryIdentifier=${{ secrets.BINARY_IDENTIFIER }}" -X "${{ env.CONFIG_PATH }}.LnsBrokers=${{ secrets.LNS_BROKERS }}"  -X "${{ env.CONFIG_PATH }}.LnsQueueName=${{ secrets.LNS_QUEUE_NAME }}" -X "${{ env.CONFIG_PATH }}.MacType=macmini"'
+          AZURE_LDFLAGS='-X "${{ env.CONFIG_PATH }}.ReceiveQueueConStr=${{ secrets.RECEIVE_QUEUE_CON_STR }}" -X "${{ env.CONFIG_PATH }}.SendQueueConStr=${{ secrets.SEND_QUEUE_CON_STR }}" -X "${{ env.CONFIG_PATH }}.StorageAccountKey=${{ secrets.STORAGE_ACCOUNT_KEY }}" -X "${{ env.CONFIG_PATH }}.StorageAccountName=${{ secrets.STORAGE_ACCOUNT_NAME }}" -X "${{ env.CONFIG_PATH }}.QueuePlatform=${{ secrets.QUEUE_PLATFORM }}" -X "${{ env.CONFIG_PATH }}.ServiceBusNamespace=${{ secrets.SERVICE_BUS_NAMESPACE }}" -X "${{ env.CONFIG_PATH }}.LnsPlatform=${{ secrets.LNS_PLATFORM }}" -X "${{ env.CONFIG_PATH }}.DownloadBinaryStorageName=${{ secrets.DOWNLOAD_BINARY_STORAGE_NAME }}"'
+          GIT_LDFLAGS='-X "${{ env.CONFIG_PATH }}.GitAuthToken=${{ secrets.GIT_AUTH_TOKEN }}"'
+          ONPREM_LDFLAGS='-X "${{ env.CONFIG_PATH }}.OnPremCloud=${{ secrets.ONPREM_CLOUD_NAME }}"'
+
+
+          OS=$(echo "linux darwin windows darwin-m1")
+          for os in ${OS}; do
+          echo "building binary for $os"
+          rm -rf ./build/${os}
+          mkdir -p ./build/${os}
+
+          FLAGS=$(echo "AwsAccessKeyId ")
+          ENV_LDFLAG='-X "${{ env.CONFIG_PATH }}.Env=prod"'
+          if [ ${os} == "windows" ]; then
+          INFRA_QUEUE_LDFLAG='-X "${{ env.CONFIG_PATH }}.InfraQueueName=${{ secrets.WINDOWS_INFRA_QUEUE_NAME }}" -X "${{ env.CONFIG_PATH }}.DebugQueueName=${{ secrets.WINDOWS_INFRA_DEBUG_QUEUE_NAME }}"'
+          GOOS=${os} GOARCH=amd64 go build -ldflags "${AWS_LDFLAGS} ${AZURE_LDFLAGS} ${GIT_LDFLAGS} ${INFRA_QUEUE_LDFLAG} ${ONPREM_LDFLAGS} ${ENV_LDFLAG}" -o build-onprem/${os}/hypertest-foreman.exe main.go && echo "binary built for $os"
+          elif [ ${os} == "linux" ]; then
+          INFRA_QUEUE_LDFLAG='-X "${{ env.CONFIG_PATH }}.InfraQueueName=${{ secrets.LINUX_INFRA_QUEUE_NAME }}" -X "${{ env.CONFIG_PATH }}.DebugQueueName=${{ secrets.LINUX_INFRA_DEBUG_QUEUE_NAME }}"'
+          GOOS=${os} GOARCH=amd64 go build -ldflags "${AWS_LDFLAGS} ${AZURE_LDFLAGS} ${GIT_LDFLAGS} ${INFRA_QUEUE_LDFLAG} ${ONPREM_LDFLAGS} ${ENV_LDFLAG}" -o build-onprem/${os}/hypertest-foreman main.go && echo "binary built for $os"
+          elif [ ${os} == "darwin-m1" ]; then
+          INFRA_QUEUE_LDFLAG='-X "${{ env.CONFIG_PATH }}.InfraQueueName=${{ secrets.MAC_INFRA_QUEUE_NAME }}" -X "${{ env.CONFIG_PATH }}.DebugQueueName=${{ secrets.MAC_INFRA_DEBUG_QUEUE_NAME }}"'
+          GOOS=darwin GOARCH=arm64 go build -ldflags "${AWS_LDFLAGS} ${AZURE_LDFLAGS} ${GIT_LDFLAGS} ${INFRA_QUEUE_LDFLAG} ${ONPREM_LDFLAGS} ${ENV_LDFLAG}" -o build-onprem/${os}/hypertest-foreman main.go && echo "binary built for $os"
+          else
+          INFRA_QUEUE_LDFLAG='-X "${{ env.CONFIG_PATH }}.InfraQueueName=${{ secrets.MAC_INFRA_QUEUE_NAME }}" -X "${{ env.CONFIG_PATH }}.DebugQueueName=${{ secrets.MAC_INFRA_DEBUG_QUEUE_NAME }}"'
+          GOOS=${os} GOARCH=amd64 go build -ldflags "${AWS_LDFLAGS} ${AZURE_LDFLAGS} ${GIT_LDFLAGS} ${INFRA_QUEUE_LDFLAG} ${ONPREM_LDFLAGS} ${ENV_LDFLAG}" -o build-onprem/${os}/hypertest-foreman main.go && echo "binary built for $os"
+          fi
+          done
+
+      - name: set-env
+        run: |
+          echo "CONNECTION_STRING=AZURE_CONNECTION_STRING_${GITHUB_REF_SLUG}" >> $GITHUB_ENV
+          echo "BOTNAME=Foreman bot ${GITHUB_REF_SLUG}" >> $GITHUB_ENV
+
+      - uses: bacongobbler/azure-blob-storage-upload@v1.2.0
+        with:
+          source_dir: build-onprem
+          container_name: ht-binaries-onprem
+          connection_string: ${{ secrets.CONNECTION_STRING }}
+          sync: false
+          extra_args: --overwrite true
+
+
+      - uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow,job,took
+          author_name: ${{ env.BOTNAME }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+        if: always()

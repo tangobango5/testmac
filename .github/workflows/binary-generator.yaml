@@ -1,0 +1,25 @@
+name: CD - Mac Test
+on:
+  push:
+    branches:
+      - mac-test
+
+jobs:
+
+  Build-To-Deploy:
+      name: Mac Test
+      runs-on: mac-test
+
+      steps:
+      - name: Inject slug/short variables
+        uses: rlespinasse/github-slug-action@v3.x
+
+      - name: Branch name
+        run: echo running on branch ${GITHUB_REF##*/}
+
+      - name: Checkout Codebase
+        uses: actions/checkout@main
+      
+      - name: Custom commands
+        run: |
+          echo "asd"
